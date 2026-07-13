@@ -261,12 +261,7 @@ async def publish_scheduled_post(time_key: str):
         if rows:
             post = rows[0]
             # Очищаем неподдерживаемые Telegram HTML-теги
-            clean_text = post['post_text'].replace("<br>", "
-").replace("<br/>", "
-").replace("<br />", "
-").replace("<p>", "").replace("</p>", "
-").replace("<div>", "").replace("</div>", "
-")
+            clean_text = post['post_text'].replace("<br>", "\n").replace("<br/>", "\n").replace("<br />", "\n").replace("<p>", "").replace("</p>", "\n").replace("<div>", "").replace("</div>", "\n")
             message_text = f"<b>{post['title']}</b>\n\n{clean_text}"
             
             # В реальном коде можно также отправлять картинку, сгенерированную по post['image_prompt']
