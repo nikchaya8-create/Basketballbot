@@ -204,35 +204,22 @@ async def generate_and_save_daily_content():
         theme_id = theme_row[0]['id']
         
         # 2. Генерация 4 постов
-        posts_sys = (
-            "Ты — копирайтер баскетбольного медиа 'BasketFlow AI'. Напиши 4 связанных поста на русском языке. "
-            "Посты должны идти последовательно: Утро (08:00) — теория и обучение, День (12:00) — упражнения/тренировка, "
-            "Вечер (18:00) — увлекательная история/мем/цитата, Ночь (21:00) — мини-совет или умный факт.
-"
-            "Верни строго JSON объект следующей структуры:
-"
-            "{
-"
-            "  "posts": [
-"
-            "    {
-"
-            "      "time": "08:00",
-"
-            "      "title": "🌅 Название поста",
-"
-            "      "text": "Текст на 100-150 слов с HTML-тегами (<b>, <i>, <code>). Закрывай теги правильно!",
-"
-            "      "imagePrompt": "Detailed English image prompt for Midjourney describing a basketball scene for this post"
-"
-            "    },
-"
-            "    ... (всего 4 поста)
-"
-            "  ]
-"
-            "}"
-        )
+        posts_sys = """Ты — копирайтер баскетбольного медиа 'BasketFlow AI'. Напиши 4 связанных поста на русском языке.
+Посты должны идти последовательно: Утро (08:00) — теория и обучение, День (12:00) — упражнения/тренировка,
+Вечер (18:00) — увлекательная история/мем/цитата, Ночь (21:00) — мини-совет или умный факт.
+
+Верни строго JSON объект следующей структуры:
+{
+  "posts": [
+    {
+      "time": "08:00",
+      "title": "🌅 Название поста",
+      "text": "Текст на 100-150 слов с HTML-тегами (<b>, <i>, <code>). Закрывай теги правильно!",
+      "imagePrompt": "Detailed English image prompt for Midjourney describing a basketball scene for this post"
+    },
+    ... (всего 4 поста)
+  ]
+}"""
         posts_usr = f"Напиши посты по теме: '{theme}'."
         
         raw_json = await query_gemini(posts_sys, posts_usr, json_mode=True)
@@ -274,11 +261,6 @@ async def publish_scheduled_post(time_key: str):
         if rows:
             post = rows[0]
             message_text = f"<b>{post['title']}</b>\n\n{post['post_text']}"
-            
-            # В реальном коде можно также отправлять картинку, сгенерированную по post['image_prompt']
-            # Но так как бот работает на сервере без GPU, мы отправляем текстовый пост.
-            # Если у вас есть подписка на генератор картинок, вы можете отправить фото:
-            # await bot.send_photo(chat_id=CHAT_ID, photo=image_url, caption=message_text, parse_mode="HTML")
             
             await bot.send_message(
                 chat_id=CHAT_ID,
@@ -331,8 +313,7 @@ async def handle_group_comments(message: types.Message):
         "Твой ответ должен быть СТРОГО коротким: от 3 до 10 слов на русском языке. "
         "Тон — мотивирующий, экспертный, дружелюбный. Используй максимум один эмодзи 🏀."
     )
-    reply_usr = f"Пост: '{message.reply_to_message.text[:150]}'
-Комментарий подписчика: '{message.text}'"
+    reply_usr = f"Пост: '{message.reply_to_message.text[:150]}'\nКомментарий подписчика: '{message.text}'"
     
     try:
         ai_reply = await query_gemini(reply_sys, reply_usr)
