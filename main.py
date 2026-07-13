@@ -24,7 +24,8 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 
 bot = None
 dp = Dispatcher()
-scheduler = AsyncIOScheduler()
+BOT_TIMEZONE = os.environ.get("BOT_TIMEZONE", "Asia/Yekaterinburg")
+scheduler = AsyncIOScheduler(timezone=BOT_TIMEZONE)
 db_pool = None # Пул подключений PostgreSQL
 
 # Очередь фоллбека (на случай, если лимиты Gemini временно исчерпаны)
@@ -264,32 +265,12 @@ async def publish_scheduled_post(time_key: str):
             clean_text = post['post_text'].replace("<br>", "\n").replace("<br/>", "\n").replace("<br />", "\n").replace("<p>", "").replace("</p>", "\n").replace("<div>", "").replace("</div>", "\n")
             message_text = f"<b>{post['title']}</b>\n\n{clean_text}"
             
-            image_prompt = post['image_prompt']
-            if image_prompt:
-                try:
-                    import urllib.parse
-                    encoded_prompt = urllib.parse.quote(image_prompt)
-                    image_url = f"https://image.pollinations.ai/prompt/{encoded_prompt}?width=1024&height=1024&nologo=true&private=true"
-                    logging.info(f"🎨 Отправляем фото через Pollinations по промпту: {image_prompt}")
-                    await bot.send_photo(
-                        chat_id=CHAT_ID,
-                        photo=image_url,
-                        caption=message_text[:1024], # Лимит подписи Telegram — 1024 символа
-                        parse_mode="HTML"
-                    )
-                except Exception as img_err:
-                    logging.error(f"⚠️ Не удалось отправить фото, отправляем текст: {img_err}")
-                    await bot.send_message(
-                        chat_id=CHAT_ID,
-                        text=message_text,
-                        parse_mode="HTML"
-                    )
-            else:
-                await bot.send_message(
-                    chat_id=CHAT_ID,
-                    text=message_text,
-                    parse_mode="HTML"
-                )
+            # Отправляем чистый текстовый пост без картинок (по запросу пользователя для стабильности и надежности)
+            await bot.send_message(
+                chat_id=CHAT_ID,
+                text=message_text,
+                parse_mode="HTML"
+            )
             
             # Помечаем пост как отправленный
             if db_pool:
