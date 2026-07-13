@@ -260,7 +260,19 @@ async def publish_scheduled_post(time_key: str):
             
         if rows:
             post = rows[0]
-            message_text = f"<b>{post['title']}</b>\n\n{post['post_text']}"
+            # Очищаем неподдерживаемые Telegram HTML-теги
+            clean_text = post['post_text'].replace("<br>", "
+").replace("<br/>", "
+").replace("<br />", "
+").replace("<p>", "").replace("</p>", "
+").replace("<div>", "").replace("</div>", "
+")
+            message_text = f"<b>{post['title']}</b>\n\n{clean_text}"
+            
+            # В реальном коде можно также отправлять картинку, сгенерированную по post['image_prompt']
+            # Но так как бот работает на сервере без GPU, мы отправляем текстовый пост.
+            # Если у вас есть подписка на генератор картинок, вы можете отправить фото:
+            # await bot.send_photo(chat_id=CHAT_ID, photo=image_url, caption=message_text, parse_mode="HTML")
             
             await bot.send_message(
                 chat_id=CHAT_ID,
@@ -416,3 +428,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+        
