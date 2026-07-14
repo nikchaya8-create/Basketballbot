@@ -2,13 +2,14 @@ import asyncio
 import logging
 import os
 import json
+import random
 import httpx
 from datetime import datetime
 
 from aiohttp import web
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command, StateFilter
-from aiogram.types import Message
+from aiogram.types import Message, ContentType
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -42,10 +43,7 @@ db = {
 # ==================== ИИ ГЕНЕРАЦИЯ (GEMINI) ====================
 
 async def ask_gemini(prompt: str, json_mode=False):
-    # Исправлено: Используем корректное имя модели gemini-1.5-flash или gemini-2.0-flash
-    model_name = "gemini-1.5-flash"
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={GEMINI_API_KEY}"
-    
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}"
     payload = {
         "contents": [{"parts": [{"text": prompt}]}]
     }
@@ -54,13 +52,7 @@ async def ask_gemini(prompt: str, json_mode=False):
         
     async with httpx.AsyncClient() as client:
         response = await client.post(url, json=payload, timeout=30.0)
-        # Безопасная обработка ответа
-        response.raise_for_status()
         res_data = response.json()
-        
-        if "candidates" not in res_data or not res_data["candidates"]:
-            raise ValueError(f"API Error or invalid key. Full response: {res_data}")
-            
         return res_data['candidates'][0]['content']['parts'][0]['text']
 
 async def generate_daily_content():
@@ -69,13 +61,9 @@ async def generate_daily_content():
     
     # 1. Придумываем тему дня
     theme_prompt = "Ты баскетбольный тренер. Придумай ОДНУ узкую тему на сегодня (например: Спэйсинг, Кроссовер, Защита зоны). Верни только 1-3 слова."
-    try:
-        theme = await ask_gemini(theme_prompt)
-        db["daily_theme"] = theme.strip()
-        logging.info(f"Тема дня: {db['daily_theme']}")
-    except Exception as e:
-        logging.error(f"Ошибка генерации темы: {e}")
-        return
+    theme = await ask_gemini(theme_prompt)
+    db["daily_theme"] = theme.strip()
+    logging.info(f"Тема дня: {db['daily_theme']}")
     
     # 2. Генерируем 5 постов (JSON)
     posts_prompt = f"""Напиши 5 связанных постов для баскетбольного Telegram-канала на тему: '{db['daily_theme']}'.
@@ -96,7 +84,7 @@ async def generate_daily_content():
         db["today_posts"] = data.get("posts", [])
         logging.info("✅ 5 постов успешно сгенерированы!")
     except Exception as e:
-        logging.error(f"Ошибка генерации постов: {e}")
+        logging.error(f"Ошибка генерации: {e}")
 
 # ==================== АВТО-ПОСТИНГ ====================
 
@@ -112,45 +100,12 @@ async def send_scheduled_post(time_idx: int):
         except Exception as e:
             logging.error(f"Ошибка отправки поста: {e}")
 
-# ==================== АДМИН ПАНЕЛЬ (Личка с ботом) ====================
-# Исправлено: Команды админки вынесены ВЫШЕ общего обработчика комментариев,
-# чтобы общий @dp.message() не перехватывал и не глушил их.
-
-@dp.message(Command("start"), F.chat.type == "private")
-async def admin_start(message: Message):
-    if message.from_user.id != ADMIN_ID:
-        return await message.answer("Извините, у вас нет доступа к админ-панели.")
-    
-    await message.answer(
-        "👋 <b>Добро пожаловать в Админ Панель!</b>\n\n"
-        "Вы можете отправить мне текст, фото или видео, и я перешлю это в канал от своего имени.\n"
-        "Отправьте /post для создания ручного поста.", parse_mode="HTML"
-    )
-
-@dp.message(Command("post"), F.chat.id == ADMIN_ID)
-async def admin_create_post(message: Message, state: FSMContext):
-    await message.answer("Пришлите текст или фото+текст для канала:")
-    await state.set_state(AdminPost.waiting_for_content)
-
-@dp.message(AdminPost.waiting_for_content, F.chat.id == ADMIN_ID)
-async def admin_publish_post(message: Message, state: FSMContext):
-    try:
-        # Копируем сообщение админа напрямую в канал
-        await message.copy_to(chat_id=CHANNEL_ID)
-        await message.answer("✅ Успешно опубликовано в канал!")
-    except Exception as e:
-        await message.answer(f"❌ Ошибка публикации: {e}")
-    finally:
-        await state.clear()
-
 # ==================== ОТВЕТЫ НА КОММЕНТАРИИ ====================
-# Исправлено: Общий обработчик сообщений теперь идет последним.
-# Он отвечает только на комментарии в обсуждениях канала.
 
 @dp.message()
 async def auto_reply_comments(message: Message, state: FSMContext):
     """Автоматический ответ на комментарии подписчиков"""
-    # Игнорируем личные сообщения (чтобы админка работала корректно)
+    # Игнорируем админа в личке
     if message.chat.type == "private":
         return
         
@@ -176,6 +131,36 @@ async def auto_reply_comments(message: Message, state: FSMContext):
         db["replied_comments"].add(message.message_id)
     except Exception as e:
         logging.error(f"Ошибка ответа: {e}")
+
+
+# ==================== АДМИН ПАНЕЛЬ (Личка с ботом) ====================
+
+@dp.message(Command("start"), F.chat.type == "private")
+async def admin_start(message: Message):
+    if message.from_user.id != ADMIN_ID:
+        return await message.answer("Извините, у вас нет доступа.")
+    
+    await message.answer(
+        "👋 <b>Добро пожаловать в Админ Панель!</b>\n\n"
+        "Вы можете отправить мне текст, фото или видео, и я перешлю это в канал от своего имени.\n"
+        "Отправьте /post для создания ручного поста.", parse_mode="HTML"
+    )
+
+@dp.message(Command("post"), F.chat.id == ADMIN_ID)
+async def admin_create_post(message: Message, state: FSMContext):
+    await message.answer("Пришлите текст или фото+текст для канала:")
+    await state.set_state(AdminPost.waiting_for_content)
+
+@dp.message(AdminPost.waiting_for_content, F.chat.id == ADMIN_ID)
+async def admin_publish_post(message: Message, state: FSMContext):
+    try:
+        # Копируем сообщение админа напрямую в канал
+        await message.copy_to(chat_id=CHANNEL_ID)
+        await message.answer("✅ Успешно опубликовано в канал!")
+    except Exception as e:
+        await message.answer(f"❌ Ошибка публикации: {e}")
+    finally:
+        await state.clear()
 
 # ==================== ВЕБ-СЕРВЕР ДЛЯ RENDER ====================
 
