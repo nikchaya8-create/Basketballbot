@@ -1,242 +1,202 @@
 import asyncio
 import logging
 import os
-from datetime import datetime
 import json
+import random
 import httpx
+from datetime import datetime
+
 from aiohttp import web
-from aiogram import Bot, Dispatcher, types
-from aiogram.filters import Command
+from aiogram import Bot, Dispatcher, types, F
+from aiogram.filters import Command, StateFilter
+from aiogram.types import Message, ContentType
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 
-# НАСТРОЙКИ БОТА
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN")
-CHAT_ID = os.environ.get("CHAT_ID", "YOUR_CHAT_ID")
-
-# Парсим ID топиков группы (Forum Threads)
-env_polls_id = os.environ.get("POLLS_THREAD_ID", "")
-POLLS_THREAD_ID = int(env_polls_id) if env_polls_id and env_polls_id.isdigit() else None
-
-env_tips_id = os.environ.get("TIPS_THREAD_ID", "")
-TIPS_THREAD_ID = int(env_tips_id) if env_tips_id and env_tips_id.isdigit() else None
-
-# Ключ Gemini API для генерации уникальных советов (Опционально)
+# НАСТРОЙКИ (Берутся из переменных окружения Render)
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "YOUR_BOT_TOKEN")
+CHANNEL_ID = os.environ.get("CHANNEL_ID", "YOUR_CHANNEL_ID")
+ADMIN_ID = int(os.environ.get("ADMIN_ID", 0))  # Ваш личный ID для админки
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "YOUR_GEMINI_API_KEY")
+TIMEZONE = "Asia/Yekaterinburg"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
-bot = None
-dp = Dispatcher()
-BOT_TIMEZONE = os.environ.get("BOT_TIMEZONE", "Asia/Yekaterinburg")
-scheduler = AsyncIOScheduler(timezone=BOT_TIMEZONE)
+# Состояния для Админки
+class AdminPost(StatesGroup):
+    waiting_for_content = State()
 
-# Встроенная база баскетбольных статей на случай отсутствия ключа AI
-BASKETBALL_TIPS_DATABASE = [
-    {
-        "title": "🏀 СЕКРЕТ ИДЕАЛЬНОГО БРОСКА: МЕХАНИКА И ТОЧКИ КОНТРОЛЯ",
-        "text": "Каждый великий снайпер знает: стабильный бросок — это чистая физика и мышечная память. Локоть должен быть строго сонаправлен кольцу под углом 90 градусов. Не заводите мяч далеко за голову. Важнейшая точка контроля — фиксация расслабленной кисти («гусиная шея») после релиза мяча до его касания кольца. Это придает правильное обратное вращение."
-    },
-    {
-        "title": "💪 РАЗВИТИЕ МЫШЦ КОРА (БАЗА ДЛЯ ПРЫЖКА И СТАБИЛЬНОСТИ)",
-        "text": "Мышцы кора (пресс, косые мышцы, поясница) — это мост передачи энергии от ног к рукам. Без сильного кора вы будете терять баланс при броске в прыжке и контакте в воздухе. Добавьте в тренировки статическую планку (3 подхода по 1.5 мин), боковые планки и динамические скручивания «книжка». Это защитит поясницу от травм."
-    },
-    {
-        "title": "⚡️ ДРИБЛИНГ СО СМЕНОЙ ТЕМПА (HESITATION MOVE)",
-        "text": "Самый эффективный кроссовер — это не самый быстрый, а тот, который меняет темп. Научитесь усыплять бдительность защитника: ведите мяч высоко и медленно, выпрямляя корпус (имитируя подготовку к броску или передаче), а затем резко взрывайтесь вниз с низким ведением. Это заставит защитника подняться на носки."
-    },
-    {
-        "title": "🛡️ ЗАЩИТА ОДИН НА ОДИН: РАБОТА НОГ И КОРПУСА",
-        "text": "При защите на периметре никогда не скрещивайте ноги — двигайтесь приставными шагами в низкой стойке. Смотрите сопернику в область пояса (ее невозможно сымитировать финтом в отличие от головы или мяча). Держите одну руку на уровне его глаз для помехи броску, а вторую опустите ниже для перехвата передач."
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher(storage=MemoryStorage())
+scheduler = AsyncIOScheduler(timezone=TIMEZONE)
+
+# Простая in-memory БД (Для Render рекомендуется использовать PostgreSQL)
+db = {
+    "daily_theme": "Бросок",
+    "replied_comments": set(),
+    "today_posts": []
+}
+
+# ==================== ИИ ГЕНЕРАЦИЯ (GEMINI) ====================
+
+async def ask_gemini(prompt: str, json_mode=False):
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}"
+    payload = {
+        "contents": [{"parts": [{"text": prompt}]}]
     }
-]
+    if json_mode:
+        payload["generationConfig"] = {"responseMimeType": "application/json"}
+        
+    async with httpx.AsyncClient() as client:
+        response = await client.post(url, json=payload, timeout=30.0)
+        res_data = response.json()
+        return res_data['candidates'][0]['content']['parts'][0]['text']
 
-tip_counter = 0
-
-async def generate_or_get_tip():
-    global tip_counter
-    if not GEMINI_API_KEY or GEMINI_API_KEY == "YOUR_GEMINI_API_KEY":
-        tip = BASKETBALL_TIPS_DATABASE[tip_counter % len(BASKETBALL_TIPS_DATABASE)]
-        tip_counter += 1
-        return f"<b>{tip['title']}</b>\n\n{tip['text']}\n\n<i>Подумайте об этом! Стабильность создается в деталях.</i>"
+async def generate_daily_content():
+    """Генерирует 5 связанных постов на день"""
+    logging.info("Генерация ежедневного контента...")
+    
+    # 1. Придумываем тему дня
+    theme_prompt = "Ты баскетбольный тренер. Придумай ОДНУ узкую тему на сегодня (например: Спэйсинг, Кроссовер, Защита зоны). Верни только 1-3 слова."
+    theme = await ask_gemini(theme_prompt)
+    db["daily_theme"] = theme.strip()
+    logging.info(f"Тема дня: {db['daily_theme']}")
+    
+    # 2. Генерируем 5 постов (JSON)
+    posts_prompt = f"""Напиши 5 связанных постов для баскетбольного Telegram-канала на тему: '{db['daily_theme']}'.
+Формат вывода строго JSON:
+{{
+  "posts": [
+    {{"time_idx": 0, "type": "Техника", "text": "Текст утреннего поста с тегами <b> и <i> (до 100 слов)"}},
+    {{"time_idx": 1, "type": "Упражнение", "text": "Текст дневного упражнения"}},
+    {{"time_idx": 2, "type": "Юмор/Мем", "text": "Шутка или жизненная ситуация про баскетбол"}},
+    {{"time_idx": 3, "type": "Тактика", "text": "Вечерний разбор тактики"}},
+    {{"time_idx": 4, "type": "Цитата", "text": "Мотивирующая цитата на ночь"}}
+  ]
+}}"""
     
     try:
-        url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
-        headers = {"Content-Type": "application/json"}
-        params = {"key": GEMINI_API_KEY}
-        payload = {
-            "contents": [{
-                "parts": [{
-                    "text": "Напиши профессиональную, полезную, мотивирующую статью о баскетболе (тактика, ОФП, дриблинг, бросок, защита) в формате HTML для Telegram. Используй теги <b>, <i>, <code>. Статья должна начинаться с яркого заголовка с эмодзи. Не используй теги <p> или <br>. Используй обычные переносы строк."
-                }]
-            }]
-        }
-        async with httpx.AsyncClient() as client:
-            response = await client.post(url, json=payload, headers=headers, params=params, timeout=15.0)
-            res_data = response.json()
-            raw_text = res_data['candidates'][0]['content']['parts'][0]['text']
-            return raw_text
+        raw_json = await ask_gemini(posts_prompt, json_mode=True)
+        data = json.loads(raw_json)
+        db["today_posts"] = data.get("posts", [])
+        logging.info("✅ 5 постов успешно сгенерированы!")
     except Exception as e:
-        logging.error(f"Ошибка вызова Gemini: {e}")
-        tip = BASKETBALL_TIPS_DATABASE[0]
-        return f"<b>{tip['title']}</b>\n\n{tip['text']}"
+        logging.error(f"Ошибка генерации: {e}")
 
-# ФУНКЦИИ ОТПРАВКИ ОПРОСОВ И СТАТЕЙ
+# ==================== АВТО-ПОСТИНГ ====================
 
-async def send_custom_poll(question, options, emoji):
+async def send_scheduled_post(time_idx: int):
+    """Функция отправки конкретного поста (0-4)"""
+    posts = db.get("today_posts", [])
+    if time_idx < len(posts):
+        post = posts[time_idx]
+        text = f"🏀 <b>Тема дня: {db['daily_theme']} | {post['type']}</b>\n\n{post['text']}"
+        try:
+            await bot.send_message(chat_id=CHANNEL_ID, text=text, parse_mode="HTML")
+            logging.info(f"Отправлен пост #{time_idx}")
+        except Exception as e:
+            logging.error(f"Ошибка отправки поста: {e}")
+
+# ==================== ОТВЕТЫ НА КОММЕНТАРИИ ====================
+
+@dp.message()
+async def auto_reply_comments(message: Message, state: FSMContext):
+    """Автоматический ответ на комментарии подписчиков"""
+    # Игнорируем админа в личке
+    if message.chat.type == "private":
+        return
+        
+    # Проверяем, что сообщение - это ответ на пост канала в группе-обсуждении
+    if not message.reply_to_message or not message.reply_to_message.from_user:
+        return
+    if message.reply_to_message.from_user.id != bot.id:
+        return
+        
+    # Анти-дубль
+    if message.message_id in db["replied_comments"]:
+        return
+        
+    logging.info(f"Новый комментарий от {message.from_user.full_name}")
+    
+    # ИИ Генерация короткого ответа
+    sys_prompt = "Ты автор баскетбольного канала. Ответь подписчику на комментарий коротко, экспертно и дружелюбно (3-10 слов, 1 эмодзи)."
+    user_prompt = f"Контекст поста: {message.reply_to_message.text[:100]}...\nКомментарий: {message.text}"
+    
     try:
-        poll_options = list(options) + [emoji]
-        await bot.send_poll(
-            chat_id=CHAT_ID,
-            question=question,
-            options=poll_options,
-            is_anonymous=False, # Видим, кто придет на тренировку!
-            message_thread_id=POLLS_THREAD_ID
-        )
-        logging.info(f"Опрос отправлен: {question}")
+        reply_text = await ask_gemini(sys_prompt + "\n\n" + user_prompt)
+        await message.reply(reply_text.strip())
+        db["replied_comments"].add(message.message_id)
     except Exception as e:
-        logging.error(f"Ошибка отправки опроса: {e}")
+        logging.error(f"Ошибка ответа: {e}")
 
-async def send_basketball_tip():
-    try:
-        text = await generate_or_get_tip()
-        await bot.send_message(
-            chat_id=CHAT_ID,
-            text=text,
-            parse_mode="HTML",
-            message_thread_id=TIPS_THREAD_ID
-        )
-        logging.info("Полезный совет отправлен!")
-    except Exception as e:
-        logging.error(f"Ошибка отправки совета: {e}")
 
-# ОПРЕДЕЛЕНИЕ РАСПИСАНИЯ ОТПРАВКИ
+# ==================== АДМИН ПАНЕЛЬ (Личка с ботом) ====================
 
-# 1. После Понедельника (во Вторник в 09:00) отправляем опрос на Четверг (21:00)
-async def post_poll_for_thursday():
-    await send_custom_poll(
-        question="Академическая\nЧт 21:00-22:30",
-        options=["Приду", "Не приду", "Не знаю"],
-        emoji="🔥"
-    )
-
-# 2. После Четверга (в Пятницу в 09:00) отправляем два опроса на Субботу (9:00 утро и 18:00 вечер)
-async def post_polls_for_saturday():
-    await send_custom_poll(
-        question="Академическая\nСб 9:00-11:00",
-        options=["Приду", "Не приду", "Не знаю"],
-        emoji="☀️"
-    )
-    await asyncio.sleep(2)
-    await send_custom_poll(
-        question="Академическая\nСб 18:00-20:00",
-        options=["Приду", "Не приду", "Не знаю"],
-        emoji="😎"
-    )
-
-# 3. После Субботы (в Воскресенье в 09:00) отправляем опрос на Понедельник (21:00)
-async def post_poll_for_monday():
-    await send_custom_poll(
-        question="Академическая\nПн 21:00-22:30",
-        options=["Приду", "Не приду", "Не знаю"],
-        emoji="🤯"
-    )
-
-# РЕГИСТРАЦИЯ КОМАНД
-
-@dp.message(Command("start"))
-async def cmd_start(message: types.Message):
+@dp.message(Command("start"), F.chat.type == "private")
+async def admin_start(message: Message):
+    if message.from_user.id != ADMIN_ID:
+        return await message.answer("Извините, у вас нет доступа.")
+    
     await message.answer(
-        "👋 <b>Привет!</b>\n\n"
-        "Я специализированный баскетбольный бот-организатор для твоей группы.\n\n"
-        "<b>Моё автоматическое расписание (Екатеринбург):</b>\n"
-        "• <b>Вторник 09:00</b> — Опрос на Четверг (21:00)\n"
-        "• <b>Пятница 09:00</b> — Опросы на Субботу Утро (9:00) и Вечер (18:00)\n"
-        "• <b>Воскресенье 09:00</b> — Опрос на Понедельник (21:00)\n"
-        "• <b>Раз в 2 дня в 12:00</b> — Публикация полезных статей в «Подумай об этом»!\n\n"
-        "<b>Команды быстрого теста:</b>\n"
-        "/poll_thursday — Отправить опрос на Четверг сейчас\n"
-        "/poll_saturday — Отправить опросы на Субботу сейчас\n"
-        "/poll_monday — Отправить опрос на Понедельник сейчас\n"
-        "/send_tip — Сгенерировать и отправить статью сейчас",
-        parse_mode="HTML"
+        "👋 <b>Добро пожаловать в Админ Панель!</b>\n\n"
+        "Вы можете отправить мне текст, фото или видео, и я перешлю это в канал от своего имени.\n"
+        "Отправьте /post для создания ручного поста.", parse_mode="HTML"
     )
 
-@dp.message(Command("poll_thursday"))
-async def force_thursday(message: types.Message):
-    await message.answer("🔄 Отправляю опрос на Четверг...")
-    await post_poll_for_thursday()
+@dp.message(Command("post"), F.chat.id == ADMIN_ID)
+async def admin_create_post(message: Message, state: FSMContext):
+    await message.answer("Пришлите текст или фото+текст для канала:")
+    await state.set_state(AdminPost.waiting_for_content)
 
-@dp.message(Command("poll_saturday"))
-async def force_saturday(message: types.Message):
-    await message.answer("🔄 Отправляю опросы на Субботу...")
-    await post_polls_for_saturday()
+@dp.message(AdminPost.waiting_for_content, F.chat.id == ADMIN_ID)
+async def admin_publish_post(message: Message, state: FSMContext):
+    try:
+        # Копируем сообщение админа напрямую в канал
+        await message.copy_to(chat_id=CHANNEL_ID)
+        await message.answer("✅ Успешно опубликовано в канал!")
+    except Exception as e:
+        await message.answer(f"❌ Ошибка публикации: {e}")
+    finally:
+        await state.clear()
 
-@dp.message(Command("poll_monday"))
-async def force_monday(message: types.Message):
-    await message.answer("🔄 Отправляю опрос на Понедельник...")
-    await post_poll_for_monday()
+# ==================== ВЕБ-СЕРВЕР ДЛЯ RENDER ====================
 
-@dp.message(Command("send_tip"))
-async def force_tip(message: types.Message):
-    await message.answer("🔄 Генерирую и отправляю баскетбольный совет...")
-    await send_basketball_tip()
-
-# ЗАПУСК ПЛАНИРОВЩИКА
-def setup_scheduler():
-    # 1. Опрос на Четверг: запускается каждый ВТОРНИК в 09:00 (Екатеринбург)
-    scheduler.add_job(post_poll_for_thursday, CronTrigger(day_of_week="tue", hour=9, minute=0))
-    
-    # 2. Опросы на Субботу: запускаются каждую ПЯТНИЦУ в 09:00 (Екатеринбург)
-    scheduler.add_job(post_polls_for_saturday, CronTrigger(day_of_week="fri", hour=9, minute=0))
-    
-    # 3. Опрос на Понедельник: запускается каждое ВОСКРЕСЕНЬЕ в 09:00 (Екатеринбург)
-    scheduler.add_job(post_poll_for_monday, CronTrigger(day_of_week="sun", hour=9, minute=0))
-    
-    # 4. Баскетбольные статьи: отправляются ЧЕРЕЗ ДЕНЬ (каждые 2 дня) в 12:00 (Екатеринбург)
-    scheduler.add_job(send_basketball_tip, CronTrigger(day="*/2", hour=12, minute=0))
-    
-    scheduler.start()
-
-# Простой веб-сервер для прохождения проверки портов на Render
 async def handle_ping(request):
-    return web.Response(text="Basketball Coach Bot is running live 24/7!")
+    """Легкий веб-сервер, чтобы Render не убивал процесс (Нужен внешний пинг каждые 10 мин)"""
+    return web.Response(text="Basketball Auto-Channel AI is alive!")
 
 async def start_web_server():
     app = web.Application()
     app.router.add_get("/", handle_ping)
-    app.router.add_get("/health", handle_ping)
     runner = web.AppRunner(app)
     await runner.setup()
     port = int(os.environ.get("PORT", 3000))
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
-    logging.info(f"Веб-сервер заглушки запущен на порту {port}")
+    logging.info(f"Веб-сервер запущен на порту {port}")
+
+# ==================== ЗАПУСК ====================
 
 async def main():
-    global bot
+    # Настраиваем расписание на 5 постов в день
+    scheduler.add_job(generate_daily_content, CronTrigger(hour=4, minute=0)) # Генерация контента ночью
     
-    try:
-        await start_web_server()
-    except Exception as e:
-        logging.error(f"Не удалось запустить веб-сервер: {e}")
-
-    if not BOT_TOKEN or BOT_TOKEN == "YOUR_TELEGRAM_BOT_TOKEN" or ":" not in BOT_TOKEN:
-        logging.error("❌❌❌ ОШИБКА НАСТРОЙКИ BOT_TOKEN! ❌❌❌")
-        logging.error("Бот находится в режиме ожидания настроек. Веб-сервер запущен, деплой на Render успешный!")
-        while True:
-            await asyncio.sleep(3600)
-
-    try:
-        bot = Bot(token=BOT_TOKEN)
-        setup_scheduler()
-        logging.info("🏀 Баскетбольный планировщик Екатеринбурга успешно запущен!")
-        logging.info("🤖 Начинаем опрос Telegram (Polling)...")
-        await dp.start_polling(bot)
-    except Exception as e:
-        logging.error(f"❌ Ошибка при запуске бота: {e}")
-        while True:
-            await asyncio.sleep(3600)
+    # Публикация в заданное время
+    scheduler.add_job(send_scheduled_post, CronTrigger(hour=9, minute=0), args=[0])  # Техника
+    scheduler.add_job(send_scheduled_post, CronTrigger(hour=12, minute=0), args=[1]) # Упражнения
+    scheduler.add_job(send_scheduled_post, CronTrigger(hour=15, minute=0), args=[2]) # Мем
+    scheduler.add_job(send_scheduled_post, CronTrigger(hour=18, minute=0), args=[3]) # Тактика
+    scheduler.add_job(send_scheduled_post, CronTrigger(hour=21, minute=0), args=[4]) # Цитата
+    scheduler.start()
+    
+    # Запуск заглушки веб-сервера
+    await start_web_server()
+    
+    logging.info("Бот запущен и готов к работе!")
+    await dp.start_polling(bot)
 
 if __name__ == "__main__":
     asyncio.run(main())
